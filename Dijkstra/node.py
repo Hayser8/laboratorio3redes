@@ -1,89 +1,114 @@
 import argparse, threading, time
-from typing import Optional
-from utils import log, now_iso, pretty
-from protocols import build_message, PROTO_DIJKSTRA, TYPE_MESSAGE, TYPE_HELLO
+from typing import Optional, List
+from utils import log, now_iso
+from protocols import (
+    new_hello, new_message,
+    sanitize_incoming, forward_transform, ExpiringSet,
+    TYPE_HELLO, TYPE_MESSAGE,
+    PROTO_DIJKSTRA,
+)
+from transport_redis import RedisTransport
 from config_loader import load_topology, load_names
-from transport import JsonLineServer, send_json_line
 from router_dijkstra import DijkstraRouter
 
+
 class Node:
-    def __init__(self, node_id:str, topo_path:str, names_path:str, default_ttl:int=8, hello_interval:float=10.0):
+    def __init__(self, node_id:str, topo_path:str, names_path:str,
+                 default_ttl:int=8, hello_interval:float=10.0,
+                 redis_host:str="localhost", redis_port:int=6379, redis_db:int=0):
         self.id = node_id
-        self.graph = load_topology(topo_path)   # weighted adjacency
-        self.addr_map = load_names(names_path)
-        self.host, self.port = self.addr_map[self.id]
-        self.neighbors = list(self.graph.get(self.id, {}).keys())
+        self.graph = load_topology(topo_path)             # dict: {A:{B:w,...}, ...}
+        self.addr_map = load_names(names_path)            # no lo usamos con Redis, pero lo mantenemos
+        self.neighbors: List[str] = list(self.graph.get(self.id, {}).keys())
 
-        # Transport server
-        self.server = JsonLineServer(self.host, self.port, handler=self._on_raw_message, name=f"server-{self.id}")
+        # Transport (Redis Pub/Sub)
+        self.transport = RedisTransport(
+            node_id=self.id,
+            on_packet=self._on_packet,
+            host=redis_host, port=redis_port, db=redis_db
+        )
 
-        # Routing strategy (Dijkstra)
+        # Routing (SPF estático sobre self.graph)
         self.router = DijkstraRouter(self.graph)
-        self.router.refresh_for(self.id)
+        self.router.refresh_for(self.id)                  # genera dist, next_hop, paths
 
-        # Default TTL
+        # Control
         self.default_ttl = default_ttl
-
-        # Hello/Ping (informativo)
         self.hello_interval = hello_interval
         self._hello_stop = threading.Event()
-        self._hello_rtts = {}
-        self._pending_pings = {}
 
-    # Transport helpers
-    def send_direct(self, neighbor_id:str, msg:dict):
-        if neighbor_id not in self.addr_map:
-            log(f"[warn] unknown neighbor {neighbor_id}")
-            return
-        host, port = self.addr_map[neighbor_id]
-        try:
-            send_json_line(host, port, msg)
-        except Exception as e:
-            log(f"[err] failed to send to {neighbor_id} at {host}:{port}: {e}")
+        # Anti-duplicados
+        self.seen = ExpiringSet(ttl_seconds=60)
 
-    # Inbound
-    def _on_raw_message(self, obj:dict, addr):
-        incoming_last_hop = obj.get("headers", {}).get("last_hop")
-        self.router.on_receive(self, obj, incoming_last_hop)
+    # --- helpers de envío ---
+    def send_direct(self, neighbor_id:str, pkt:dict):
+        """Unicast al inbox del vecino (no valida TTL)."""
+        self.transport.publish_packet(neighbor_id, pkt)
 
-    def on_echo(self, msg:dict):
-        mid = msg.get("id")
-        if mid in self._pending_pings:
-            t0, nb = self._pending_pings.pop(mid)
-            rtt_ms = int((time.time() - t0) * 1000)
-            self._hello_rtts[nb] = rtt_ms
-            log(f"[RTT] {self.id} <-> {nb}: {rtt_ms} ms")
+    def broadcast(self, pkt:dict, exclude:Optional[str]=None):
+        """Broadcast manual a todos los vecinos (opcionalmente excluye al prev hop)."""
+        self.transport.broadcast(self.neighbors, pkt, exclude=exclude)
 
-    # Threads
+    # --- ciclo de vida ---
     def start(self):
-        log(f"[node] {self.id} starting at {self.host}:{self.port} with neighbors={self.neighbors}")
-        self.server.start()
+        log(f"[node] {self.id} neighbors={self.neighbors}")
+        self.transport.start()
         threading.Thread(target=self._hello_loop, name=f"hello-{self.id}", daemon=True).start()
         self._console_loop()
 
     def _hello_loop(self):
-        # pequeño delay para que todos levanten
-        time.sleep(1.0)
+        time.sleep(1.0)  # pequeño delay para que todos arranquen
         while not self._hello_stop.is_set():
-            for nb in self.neighbors:
-                self._send_hello(nb)
-                time.sleep(0.05)
+            pkt = new_hello(self.id, proto=PROTO_DIJKSTRA, ttl=2)
+            self.broadcast(pkt)
             self._hello_stop.wait(self.hello_interval)
 
-    def _send_hello(self, neighbor_id:str):
-        msg = build_message(PROTO_DIJKSTRA, TYPE_HELLO, self.id, neighbor_id, ttl=2, payload="", headers={"ts": now_iso()})
-        self._pending_pings[msg["id"]] = (time.time(), neighbor_id)
-        self.send_direct(neighbor_id, msg)
+    # --- recepción ---
+    def _on_packet(self, pkt:dict, _src:str):
+        # 1) estructura válida
+        try:
+            pkt = sanitize_incoming(pkt)
+        except Exception:
+            return
 
-    # Console
+        # 2) duplicados
+        mid = pkt.get("msg_id")
+        if mid and not self.seen.add_if_new(mid):
+            return
+
+        ptype = pkt.get("type")
+        dest  = pkt.get("to")
+        headers = pkt.get("headers", [])
+        prev_hop = headers[-1] if headers else None  # último router por el que pasó
+
+        if ptype == TYPE_HELLO:
+            # Dijkstra no retransmite HELLO
+            return
+
+        if ptype == TYPE_MESSAGE:
+            if dest == self.id:
+                log(f"[deliver] {self.id} <- {pkt.get('from')}: {pkt.get('payload')}")
+                return
+            # forward hop-by-hop usando la tabla SPF
+            nh = self.router.next_hop.get(dest)
+            if not nh:
+                log(f"[drop] no route {self.id}->{dest}")
+                return
+            fwd = forward_transform(pkt, self.id)
+            if fwd is None:
+                return
+            self.send_direct(nh, fwd)
+            return
+
+        # Otros tipos se ignoran en modo Dijkstra puro
+
+    # --- consola ---
     def _console_loop(self):
         help_text = (
             "Commands:\n"
-            "  send <DEST> <TEXT>   - send DATA via Dijkstra (next-hop)\n"
+            "  send <DEST> <TEXT>   - send DATA via Dijkstra\n"
             "  table                - print routing table (next-hop, cost)\n"
-            "  route <DEST>         - show full path to DEST\n"
-            "  ping <NEIGHBOR>      - hello/echo\n"
-            "  peers                - list neighbors and last RTT\n"
+            "  route <DEST>         - show SPF path\n"
             "  ttl <N>              - set default TTL\n"
             "  help                 - show help\n"
             "  quit                 - exit\n"
@@ -105,17 +130,10 @@ class Node:
             elif cmd == "table":
                 self._print_table()
             elif cmd == "route" and len(parts) == 2:
-                dest = parts[1]
-                self._print_route(dest)
-            elif cmd == "ping" and len(parts) == 2:
-                nb = parts[1]
-                self._send_hello(nb)
-            elif cmd == "peers":
-                self._print_peers()
+                self._print_route(parts[1])
             elif cmd == "ttl" and len(parts) == 2:
                 try:
-                    self.default_ttl = int(parts[1])
-                    log(f"default TTL set to {self.default_ttl}")
+                    self.default_ttl = int(parts[1]); log(f"default TTL set to {self.default_ttl}")
                 except ValueError:
                     log("ttl must be an integer")
             elif cmd == "help":
@@ -132,48 +150,42 @@ class Node:
             return
         nh = self.router.next_hop.get(dest)
         if not nh:
-            log(f"[drop] no route from {self.id} to {dest}")
+            log(f"[drop] no route {self.id}->{dest}")
             return
-        msg = build_message(PROTO_DIJKSTRA, TYPE_MESSAGE, self.id, dest, ttl=self.default_ttl, payload=text, headers={"ts": now_iso(), "last_hop": self.id})
-        self.send_direct(nh, msg)
+        pkt = new_message(self.id, dest, text, proto=PROTO_DIJKSTRA, ttl=self.default_ttl)
+        self.send_direct(nh, pkt)
 
     def _print_table(self):
         log("Routing table (next-hop | cost):")
-        for dest, nh in sorted(self.router.next_hop.items()):
-            cost = self.router.dist.get(dest, "?")
-            log(f"  {self.id} -> {dest} : next-hop={nh} cost={cost}")
+        for d, nh in sorted(self.router.next_hop.items()):
+            cost = self.router.dist.get(d, "?")
+            log(f"  {self.id}->{d} : next-hop={nh} cost={cost}")
 
     def _print_route(self, dest:str):
         path = self.router.paths.get(dest, [])
-        if path:
-            log(" -> ".join(path))
-        else:
-            log(f"[no-path] {self.id} to {dest}")
-
-    def _print_peers(self):
-        log(f"Neighbors of {self.id}: {self.neighbors}")
-        for nb, rtt in self._hello_rtts.items():
-            log(f"  {nb}: {rtt} ms")
+        log(" -> ".join(path) if path else f"[no-path] {self.id}->{dest}")
 
     def _shutdown(self):
         log(f"[node] {self.id} shutting down...")
         self._hello_stop.set()
-        try:
-            self.server.stop()
-        except Exception:
-            pass
+        try: self.transport.stop()
+        except: pass
+
 
 def main():
-    import argparse
-    ap = argparse.ArgumentParser(description="Dijkstra Node (Local Sockets)")
-    ap.add_argument("--id", required=True, help="Node ID (e.g., A)")
-    ap.add_argument("--topo", required=True, help="Path to topology JSON")
-    ap.add_argument("--names", required=True, help="Path to names JSON (host:port per node)")
-    ap.add_argument("--ttl", type=int, default=8, help="Default TTL for outgoing DATA")
-    ap.add_argument("--hello", type=float, default=10.0, help="Hello interval seconds")
+    ap = argparse.ArgumentParser(description="Dijkstra Node (Redis Pub/Sub)")
+    ap.add_argument("--id", required=True)
+    ap.add_argument("--topo", required=True)
+    ap.add_argument("--names", required=True)
+    ap.add_argument("--ttl", type=int, default=8)
+    ap.add_argument("--hello", type=float, default=10.0)
+    ap.add_argument("--redis-host", default="localhost")
+    ap.add_argument("--redis-port", type=int, default=6379)
+    ap.add_argument("--redis-db", type=int, default=0)
     args = ap.parse_args()
 
-    node = Node(args.id, args.topo, args.names, default_ttl=args.ttl, hello_interval=args.hello)
+    node = Node(args.id, args.topo, args.names, args.ttl, args.hello,
+                redis_host=args.redis_host, redis_port=args.redis_port, redis_db=args.redis_db)
     node.start()
 
 if __name__ == "__main__":
