@@ -1,22 +1,17 @@
 """
 protocols.py — Estándar JSON de mensajes + utilidades comunes.
 
-Formato JSON obligatorio (v1):
+Formato JSON (v1):
 {
   "proto":   "dijkstra|flooding|lsr|dvr",
   "type":    "hello|info|message|echo|lsp",
   "from":    "A",
   "to":      "B|broadcast",
   "ttl":     5,
-  "headers": ["A","B","C"],   # últimos hops para detectar ciclos (máx. 3)
-  "payload": {},              # tabla/LSP/datos de usuario según type
-  "msg_id":  "uuid-..."       # para suprimir duplicados
+  "headers": ["A","B","C"]  ó  {"trail":[...], "last_hop":"X"},
+  "payload": {},
+  "msg_id":  "uuid-..."
 }
-
-Notas:
-- HELLO: broadcast a vecinos directos; NO se retransmite al recibir.
-- INFO/LSP: broadcast con retransmisión; al reenviar hacer ttl-- y rotar headers.
-- MESSAGE (DATA): unicast hop-by-hop usando tu tabla de ruteo.
 """
 
 from __future__ import annotations
@@ -24,92 +19,72 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import uuid
 import time
 
-# =========================
-# Constantes de protocolo
-# =========================
-
-# proto
+# ---- Constantes
 PROTO_DIJKSTRA = "dijkstra"
 PROTO_FLOODING = "flooding"
 PROTO_LSR      = "lsr"
 PROTO_DVR      = "dvr"
 
-# type
 TYPE_HELLO   = "hello"
-TYPE_INFO    = "info"     # puede usarse para DV o info general
-TYPE_LSP     = "lsp"      # típico de LSR (Link State Packet)
-TYPE_MESSAGE = "message"  # datos de usuario
+TYPE_INFO    = "info"
+TYPE_LSP     = "lsp"
+TYPE_MESSAGE = "message"
 TYPE_ECHO    = "echo"
 
-# otros
 BROADCAST = "broadcast"
-
-# parámetros por defecto
 DEFAULT_TTL_INFO     = 5
 DEFAULT_TTL_MESSAGE  = 8
 HEADERS_MAXLEN       = 3
 
-
-# =========================
-# Helpers generales
-# =========================
-
+# ---- Helpers
 def make_msg_id() -> str:
     return str(uuid.uuid4())
-
 
 def normalize_headers(headers: Optional[Iterable[str]]) -> List[str]:
     if headers is None:
         return []
-    # filtra nulos y castea a str
     out = [str(h) for h in headers if h is not None]
     return out[-HEADERS_MAXLEN:]
 
+def _extract_trail_from_headers_maybe_dict(hval: Any) -> List[str]:
+    """
+    Acepta:
+      - list -> se normaliza
+      - dict -> usa 'trail' si existe y es list, si no -> []
+      - None/otros -> []
+    """
+    if isinstance(hval, list):
+        return normalize_headers(hval)
+    if isinstance(hval, dict):
+        trail = hval.get("trail")
+        if isinstance(trail, list):
+            return normalize_headers(trail)
+        return []
+    return []
 
 def rotate_headers(headers: Optional[Iterable[str]], self_id: str,
                    maxlen: int = HEADERS_MAXLEN) -> List[str]:
-    """
-    Regla del enunciado:
-    - al reenviar, remover el primer elemento
-    - agregar self_id al final
-    - mantener últimos 3
-    """
     hs = list(headers or [])
     if hs:
         hs = hs[1:]
     hs.append(self_id)
     return hs[-maxlen:]
 
-
 def should_drop_for_cycle(self_id: str, headers: Optional[Iterable[str]]) -> bool:
     return self_id in set(headers or [])
-
 
 def decrement_ttl(ttl: Optional[int]) -> int:
     if ttl is None:
         return 0
     return max(int(ttl) - 1, 0)
 
-
-# =========================
-# Mensajes (builders)
-# =========================
-
+# ---- Builders
 def build_packet(
-    *,
-    proto: str,
-    ptype: str,
-    from_id: str,
-    to: str,
-    ttl: int,
-    headers: Optional[Iterable[str]] = None,
-    payload: Any = None,
+    *, proto: str, ptype: str, from_id: str, to: str, ttl: int,
+    headers: Optional[Iterable[str]] = None, payload: Any = None,
     msg_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Crea un paquete JSON conforme al estándar.
-    """
-    pkt = {
+    return {
         "proto":   str(proto),
         "type":    str(ptype),
         "from":    str(from_id),
@@ -119,76 +94,30 @@ def build_packet(
         "payload": payload if payload is not None else {},
         "msg_id":  msg_id or make_msg_id(),
     }
-    return pkt
-
 
 def new_hello(self_id: str, *, proto: str = PROTO_LSR, ttl: int = DEFAULT_TTL_INFO) -> Dict[str, Any]:
-    """
-    HELLO: broadcast a vecinos; NO se retransmite al recibir.
-    """
-    return build_packet(
-        proto=proto, ptype=TYPE_HELLO, from_id=self_id, to=BROADCAST,
-        ttl=ttl, headers=[self_id], payload={}
-    )
+    return build_packet(proto=proto, ptype=TYPE_HELLO, from_id=self_id, to=BROADCAST,
+                        ttl=ttl, headers=[self_id], payload={})
 
+def new_info(self_id: str, payload: Dict[str, Any], *,
+             proto: str = PROTO_DVR, ttl: int = DEFAULT_TTL_INFO,
+             headers: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+    return build_packet(proto=proto, ptype=TYPE_INFO, from_id=self_id, to=BROADCAST,
+                        ttl=ttl, headers=(headers or [self_id]), payload=payload)
 
-def new_info(
-    self_id: str,
-    payload: Dict[str, Any],
-    *,
-    proto: str = PROTO_DVR,  # o PROTO_LSR si usas INFO para LSR también
-    ttl: int = DEFAULT_TTL_INFO,
-    headers: Optional[Iterable[str]] = None,
-) -> Dict[str, Any]:
-    """
-    INFO: broadcast con retransmisión (ttl-- y rotación de headers al reenviar).
-    Para DV: payload puede ser tu vector de distancias.
-    Para LSR si no usas TYPE_LSP: payload puede contener la tabla/estado que difundes.
-    """
-    return build_packet(
-        proto=proto, ptype=TYPE_INFO, from_id=self_id, to=BROADCAST,
-        ttl=ttl, headers=(headers or [self_id]), payload=payload
-    )
+def new_lsp(self_id: str, lsp: Dict[str, Any], *,
+            ttl: int = DEFAULT_TTL_INFO,
+            headers: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+    return build_packet(proto=PROTO_LSR, ptype=TYPE_LSP, from_id=self_id, to=BROADCAST,
+                        ttl=ttl, headers=(headers or [self_id]), payload=lsp)
 
+def new_message(self_id: str, dest_id: str, data: Any, *,
+                proto: str = PROTO_LSR, ttl: int = DEFAULT_TTL_MESSAGE,
+                headers: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+    return build_packet(proto=proto, ptype=TYPE_MESSAGE, from_id=self_id, to=dest_id,
+                        ttl=ttl, headers=(headers or [self_id]), payload=data)
 
-def new_lsp(
-    self_id: str,
-    lsp: Dict[str, Any],
-    *,
-    ttl: int = DEFAULT_TTL_INFO,
-    headers: Optional[Iterable[str]] = None,
-) -> Dict[str, Any]:
-    """
-    LSP específico para LSR (Link State Packet).
-    """
-    return build_packet(
-        proto=PROTO_LSR, ptype=TYPE_LSP, from_id=self_id, to=BROADCAST,
-        ttl=ttl, headers=(headers or [self_id]), payload=lsp
-    )
-
-
-def new_message(
-    self_id: str,
-    dest_id: str,
-    data: Any,
-    *,
-    proto: str = PROTO_LSR,  # o el que quieras según tu modo
-    ttl: int = DEFAULT_TTL_MESSAGE,
-    headers: Optional[Iterable[str]] = None,
-) -> Dict[str, Any]:
-    """
-    MESSAGE: datos de usuario (unicast hop-by-hop).
-    """
-    return build_packet(
-        proto=proto, ptype=TYPE_MESSAGE, from_id=self_id, to=dest_id,
-        ttl=ttl, headers=(headers or [self_id]), payload=data
-    )
-
-
-# =========================
-# Validación / Sanitización
-# =========================
-
+# ---- Validación
 REQUIRED_FIELDS = ("proto", "type", "from", "to", "ttl", "headers", "payload", "msg_id")
 
 def is_valid_packet(pkt: Dict[str, Any]) -> Tuple[bool, str]:
@@ -197,42 +126,78 @@ def is_valid_packet(pkt: Dict[str, Any]) -> Tuple[bool, str]:
     for k in REQUIRED_FIELDS:
         if k not in pkt:
             return False, f"missing-field:{k}"
-    if not isinstance(pkt["headers"], list):
-        return False, "headers-not-list"
+    # headers puede ser lista o dict
+    h = pkt["headers"]
+    if not isinstance(h, (list, dict)):
+        return False, "headers-bad-type"
     try:
         int(pkt["ttl"])
     except Exception:
         return False, "ttl-not-int"
     return True, "ok"
 
+REQUIRED_FIELDS = ("proto", "type", "from", "to", "ttl", "headers", "payload", "msg_id")
 
 def sanitize_incoming(pkt: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Asegura tipos básicos y longitudes. No rota headers ni modifica TTL aquí.
-    Aplica tras deserializar JSON.
-    """
-    ok, _ = is_valid_packet(pkt)
-    if not ok:
+    # Acepta paquetes medio "sucios" y los normaliza.
+    if not isinstance(pkt, dict):
         raise ValueError("invalid-packet-structure")
 
-    pkt["proto"]   = str(pkt["proto"])
-    pkt["type"]    = str(pkt["type"])
-    pkt["from"]    = str(pkt["from"])
-    pkt["to"]      = str(pkt["to"])
-    pkt["ttl"]     = int(pkt["ttl"])
-    pkt["headers"] = normalize_headers(pkt.get("headers"))
-    # payload y msg_id se dejan como vienen (payload puede ser cualquier JSON)
+    # Normaliza campos básicos (pueden no existir aún)
+    if "proto" in pkt:   pkt["proto"] = str(pkt["proto"])
+    if "type"  in pkt:   pkt["type"]  = str(pkt["type"])
+    if "from"  in pkt:   pkt["from"]  = str(pkt["from"])
+    if "to"    in pkt:   pkt["to"]    = str(pkt["to"])
+    if "ttl"   in pkt:   pkt["ttl"]   = int(pkt["ttl"])
+
+    # -- headers: aceptar list o dict
+    h = pkt.get("headers")
+    headers_list: List[str] = []
+    if isinstance(h, list):
+        headers_list = normalize_headers(h)
+    elif isinstance(h, dict):
+        # extrae trail o path si existen
+        trail = h.get("trail")
+        path  = h.get("path")
+        if isinstance(trail, list):
+            headers_list = normalize_headers(trail)
+        elif isinstance(path, list):
+            headers_list = normalize_headers(path)
+        else:
+            headers_list = []
+    elif h is None:
+        headers_list = []
+    else:
+        # tipo raro
+        headers_list = []
+
+    pkt["headers"] = headers_list
+
+    # -- msg_id: si falta arriba, tomar de headers.msg_id; si no hay, generar
+    if "msg_id" not in pkt or not pkt.get("msg_id"):
+        hid = None
+        if isinstance(h, dict):
+            hid = h.get("msg_id")
+        pkt["msg_id"] = str(hid) if hid else make_msg_id()
+
+    # -- payload: si falta, dejar dict vacío (permitimos str también)
+    if "payload" not in pkt:
+        pkt["payload"] = {}
+
+    # -- Defaults por si venían ausentes
+    pkt.setdefault("proto", "lsr")
+    pkt.setdefault("type",  "message")
+    pkt.setdefault("from",  "?")
+    pkt.setdefault("to",    "broadcast")
+    pkt["ttl"] = int(pkt.get("ttl", 5))
+
+    # Validación final (ya normalizado)
+    for k in REQUIRED_FIELDS:
+        if k not in pkt:
+            raise ValueError(f"invalid-packet-structure")
     return pkt
 
-
 def forward_transform(pkt: Dict[str, Any], self_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Aplica reglas de forwarding para INFO/LSP/MESSAGE:
-    - Drop si ciclo (self en headers).
-    - Drop si ttl <= 0 tras decremento.
-    - Rota headers.
-    Devuelve un NUEVO dict; no muta el original.
-    """
     if should_drop_for_cycle(self_id, pkt.get("headers")):
         return None
     new_ttl = decrement_ttl(pkt.get("ttl"))
@@ -244,39 +209,35 @@ def forward_transform(pkt: Dict[str, Any], self_id: str) -> Optional[Dict[str, A
     new_pkt["headers"] = new_headers
     return new_pkt
 
-
-# =========================
-# Anti-duplicados (opcional)
-# =========================
-
+# ---- Anti-duplicados
 class ExpiringSet:
-    """
-    Set con expiración para suprimir duplicados de msg_id.
-    Uso:
-        seen = ExpiringSet(ttl_seconds=60)
-        if seen.add_if_new(pkt["msg_id"]):  # True -> primera vez
-            ... procesar ...
-    """
     def __init__(self, ttl_seconds: int = 60):
         self.ttl = int(ttl_seconds)
         self._data: Dict[str, float] = {}
-
     def _now(self) -> float:
         return time.monotonic()
-
     def _purge(self) -> None:
         now = self._now()
-        to_del = [k for k, ts in self._data.items() if now - ts > self.ttl]
-        for k in to_del:
+        for k in [k for k, ts in self._data.items() if now - ts > self.ttl]:
             del self._data[k]
-
     def add_if_new(self, key: str) -> bool:
         self._purge()
         if key in self._data:
             return False
         self._data[key] = self._now()
         return True
-
     def __contains__(self, key: str) -> bool:
         self._purge()
         return key in self._data
+
+# ---- SHIM de compatibilidad (código legado que usaba build_message)
+def build_message(proto, ptype, from_id, to, ttl=5, payload=None, headers=None, msg_id=None):
+    if isinstance(headers, list):
+        headers_list = normalize_headers(headers)
+    elif isinstance(headers, dict):
+        headers_list = _extract_trail_from_headers_maybe_dict(headers)
+    else:
+        headers_list = [str(from_id)]
+    return build_packet(proto=proto, ptype=ptype, from_id=from_id, to=to,
+                        ttl=ttl, headers=headers_list, payload=payload,
+                        msg_id=msg_id or make_msg_id())
