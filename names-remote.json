@@ -1,0 +1,16 @@
+{
+  "type": "names",
+  "host": "lab3.redesuvg.cloud",
+  "port": 6379,
+  "pwd": "UVGRedis2025",
+  "config": {
+    "A": { "channel": "sec20.topologia1.node5.test1" },
+    "B": { "channel": "sec20.topologia1.node5.test2" },
+    "C": { "channel": "sec20.topologia1.node5.test3" },
+    "D": { "channel": "sec20.topologia1.node5.test4" }
+  }
+}
+//
+/*python algorithms/flooding/node.py --id A --names names-remote.json --metric hop \
+  --transport redis \
+  --redis-url "redis://:UVGRedis2025@lab3.redesuvg.cloud:6379/0" */
