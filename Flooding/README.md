@@ -44,16 +44,22 @@ Designed to match your lab's JSON protocol and thread split (Forwarding vs Routi
 ```bash
 cd flooding-routing
 python3 node.py --id A --topo topo-sample.json --names names-sample.json
+py node.py --id A --topo topo-sample.json --names names-sample.json
+
 ```
 2) **Terminal 2**
 ```bash
 cd flooding-routing
 python3 node.py --id B --topo topo-sample.json --names names-sample.json
+py node.py --id B --topo topo-sample.json --names names-sample.json
+
 ```
 3) **Terminal 3**
 ```bash
 cd flooding-routing
 python3 node.py --id C --topo topo-sample.json --names names-sample.json
+py node.py --id C --topo topo-sample.json --names names-sample.json
+
 ```
 
 ### Send a message (from any node's interactive prompt)

@@ -1,190 +1,162 @@
-import argparse, threading, time, json, os
-from typing import Optional, List, Dict, Any, Tuple
-from utils import log, now_iso, pretty
+# Flooding/node.py
+import argparse, threading, time, json
+from typing import Optional, List
+from utils import log
 from protocols import (
-    new_hello, new_message, sanitize_incoming, forward_transform, ExpiringSet,
-    TYPE_HELLO, TYPE_LSP, TYPE_MESSAGE, TYPE_INFO,
-    PROTO_FLOODING
+    new_hello, new_message,
+    sanitize_incoming, forward_transform, ExpiringSet,
+    TYPE_HELLO, TYPE_MESSAGE, PROTO_FLOODING,
 )
 from transport_redis import RedisTransport
-from config_loader import load_neighbors_only
 
 
-def load_names_redis(names_path: Optional[str]) -> Tuple[Optional[str], Optional[int], Optional[str], Dict[str,str]]:
-    if not names_path:
-        return None, None, None, {}
-    if not os.path.exists(names_path):
-        raise FileNotFoundError(f"names file not found: {names_path}")
+# ----------------------------
+# Helpers locales (sin depender de config_loader)
+# ----------------------------
+def load_neighbors_only(topo_path: str, my_id: str) -> List[str]:
+    """Lee el topo JSON y devuelve SOLO la lista de vecinos de my_id."""
+    with open(topo_path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    assert obj.get("type") == "topo", "topology file must have type=topo"
+    cfg = obj["config"]
+    neighs = cfg.get(my_id, [])
+    return list(neighs.keys() if isinstance(neighs, dict) else neighs)
+
+def load_names_meta(names_path: str) -> dict:
+    """
+    Lee names-*.json y retorna metadatos de Redis si existen.
+    Formatos soportados:
+      {
+        "type": "names",
+        "host": "...", "port": 6379, "pwd": ".....",
+        "config": { "A": {"channel": "..."}, ... }
+      }
+    Si no hay host/port/pwd, retorna dict vacío (no rompe nada).
+    """
     with open(names_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if data.get("type") != "names":
-        raise ValueError("names file must have type='names'")
-    host = data.get("host")
-    port = data.get("port")
-    pwd  = data.get("pwd")
-    cfg = data.get("config") or {}
-    chmap = {}
-    for nid, val in cfg.items():
-        ch = val.get("channel") if isinstance(val, dict) else None
-        if ch:
-            chmap[str(nid)] = str(ch)
-    return host, port, pwd, chmap
-
-
-def _coerce_headers_list(h: Any) -> List[str]:
-    """Acepta variantes de headers (list/dict) y devuelve una lista."""
-    if isinstance(h, list):
-        return [str(x) for x in h]
-    if isinstance(h, dict):
-        if "trail" in h and isinstance(h["trail"], list):
-            return [str(x) for x in h["trail"]]
-        if "path" in h and isinstance(h["path"], list):
-            return [str(x) for x in h["path"]]
-        if "last_hop" in h and h["last_hop"] is not None:
-            return [str(h["last_hop"])]
-    return []
+        obj = json.load(f)
+    assert obj.get("type") == "names", "names file must have type=names"
+    meta = {}
+    if "host" in obj: meta["host"] = obj["host"]
+    if "port" in obj: meta["port"] = obj["port"]
+    if "pwd"  in obj: meta["pwd"]  = obj["pwd"]
+    # si te interesa el canal de tu ID, podrías leerlo aquí:
+    meta["channels"] = {}
+    cfg = obj.get("config", {})
+    for nid, entry in cfg.items():
+        if isinstance(entry, dict) and "channel" in entry:
+            meta["channels"][nid] = entry["channel"]
+    return meta
 
 
 class Node:
-    """
-    Flooding puro:
-      - Reenvía TODO (HELLO/LSP/INFO/MESSAGE) con TTL>0, excepto al prev_hop.
-      - Suprime duplicados por msg_id.
-      - Evita ciclos si nuestro id ya está en headers.
-    """
-    def __init__(self, node_id:str, topo_path:str,
-                 names_path: Optional[str] = None,
-                 default_ttl:int=8, hello_interval:float=5.0,
-                 redis_host:str="localhost", redis_port:int=6379, redis_db:int=0,
-                 redis_pass: Optional[str] = None):
+    def __init__(self, node_id:str, topo_path:str, names_path:str,
+                 default_ttl:int=6, hello_interval:float=10.0,
+                 redis_host:str="localhost", redis_port:int=6379, redis_db:int=0):
         self.id = node_id
         self.neighbors: List[str] = load_neighbors_only(topo_path, self.id)
 
-        n_host, n_port, n_pwd, chmap = (None, None, None, {})
-        if names_path:
-            try:
-                n_host, n_port, n_pwd, chmap = load_names_redis(names_path)
-            except Exception as e:
-                log(f"[warn] names-redis load failed ({e}); falling back to CLI host/port.")
+        # Metadatos de Redis (si existen en names)
+        self.redis_meta = load_names_meta(names_path)
 
-        host = n_host or redis_host
-        port = n_port or redis_port
-        pwd  = n_pwd  or redis_pass
+        # Resolver parámetros de conexión a Redis
+        host = self.redis_meta.get("host", redis_host)
+        port = int(self.redis_meta.get("port", redis_port))
+        password = self.redis_meta.get("pwd", None)
 
-        self.transport = RedisTransport(
-            node_id=self.id, on_packet=self._on_packet,
-            host=host, port=port, db=redis_db, password=pwd,
-            channel_map=chmap
-        )
+        # Crear transporte Redis (tolerante a firma de constructor)
+        tx = None
+        try:
+            # firma completa (si tu transport la soporta)
+            tx = RedisTransport(node_id=self.id, on_packet=self._on_packet,
+                                host=host, port=port, db=redis_db, password=password)
+        except TypeError:
+            # firma simple (sin password)
+            tx = RedisTransport(node_id=self.id, on_packet=self._on_packet,
+                                host=host, port=port, db=redis_db)
+        self.transport = tx
 
         self.default_ttl = default_ttl
         self.hello_interval = hello_interval
         self._hello_stop = threading.Event()
+
+        # Evita duplicados/tormentas
         self.seen = ExpiringSet(ttl_seconds=60)
 
-        # Counters
-        self.stats = {
-            "rx": 0,          # paquetes recibidos
-            "tx": 0,          # publicaciones (mensajes emitidos a vecinos)
-            "fwd": 0,         # reenvíos (número de copias reenviadas)
-            "drop_dup": 0,    # descartes por duplicado
-            "drop_ttl": 0,    # descartes por TTL (o TTL->0 al reenviar)
-            "drop_cycle": 0,  # descartes por detectar nuestro id en headers
-            "drop_bad": 0,    # descartes por paquete inválido/sanitize
-        }
-
-    # -------- envío ----------
+    # --- envío ---
     def send_direct(self, neighbor_id:str, pkt:dict):
         self.transport.publish_packet(neighbor_id, pkt)
-        self.stats["tx"] += 1
-
-    def _broadcast_counting(self, pkt:dict, exclude:Optional[str]=None):
-        """Broadcast con conteo de tx/fwd."""
-        nbs = [nb for nb in self.neighbors if not (exclude and nb == exclude)]
-        for nb in nbs:
-            self.transport.publish_packet(nb, pkt)
-        self.stats["tx"] += len(nbs)
-        self.stats["fwd"] += len(nbs)
 
     def broadcast(self, pkt:dict, exclude:Optional[str]=None):
-        # por compat, pero usamos la versión contada
-        self._broadcast_counting(pkt, exclude=exclude)
+        self.transport.broadcast(self.neighbors, pkt, exclude=exclude)
 
-    # -------- ciclo de vida ----------
+    # --- ciclo de vida ---
     def start(self):
         log(f"[node] {self.id} neighbors={self.neighbors} (flooding)")
         self.transport.start()
-        time.sleep(0.5)
         threading.Thread(target=self._hello_loop, name=f"hello-{self.id}", daemon=True).start()
         self._console_loop()
 
     def _hello_loop(self):
+        time.sleep(1.0)  # pequeño delay para que todos subscriban
         while not self._hello_stop.is_set():
             pkt = new_hello(self.id, proto=PROTO_FLOODING, ttl=2)
-            # hello es broadcast: cuenta tx/fwd
-            self._broadcast_counting(pkt)
+            self.broadcast(pkt)
             self._hello_stop.wait(self.hello_interval)
 
-    # -------- recepción ----------
+    # --- recepción ---
     def _on_packet(self, pkt:dict, _src:str):
-        # Compat: si headers viene como dict, conviértelo a lista antes de sanitize
-        if isinstance(pkt, dict) and not isinstance(pkt.get("headers"), list):
-            pkt = dict(pkt)
-            pkt["headers"] = _coerce_headers_list(pkt.get("headers"))
-
         try:
             pkt = sanitize_incoming(pkt)
-        except Exception as e:
-            self.stats["drop_bad"] += 1
-            log(f"[drop] sanitize failed: {e}; raw={pretty(pkt)}")
+        except Exception:
             return
 
-        self.stats["rx"] += 1
-
-        # Duplicados
         mid = pkt.get("msg_id")
         if mid and not self.seen.add_if_new(mid):
-            self.stats["drop_dup"] += 1
+            # duplicado: no volvemos a imprimir ni reenviar
             return
 
-        ptype = pkt.get("type")
-        dest  = pkt.get("to")
-        headers_list = pkt.get("headers", [])
-        prev_hop = headers_list[-1] if headers_list else None
+        ptype   = pkt.get("type")
+        dest    = pkt.get("to")
+        src     = pkt.get("from")
+        payload = pkt.get("payload")
+        ttl     = pkt.get("ttl")
+        headers = pkt.get("headers", [])
+        prev_hop = headers[-1] if headers else None
 
-        # Entrega de datos si es para mí
-        if ptype == TYPE_MESSAGE and dest == self.id:
-            log(f"[deliver] {self.id} <- {pkt.get('from')}: {pkt.get('payload')}")
+        if ptype == TYPE_HELLO:
             return
 
-        # Evitar ciclo/ttl antes de forward_transform (para contar razones)
-        if self.id in set(headers_list or []):
-            self.stats["drop_cycle"] += 1
-            return
-        if int(pkt.get("ttl", 0)) <= 1:
-            self.stats["drop_ttl"] += 1
+        if ptype == TYPE_MESSAGE:
+            # === Requisito: que se vea en TODOS los nodos por donde pasa ===
+            is_broadcast = (dest in ("*", None))
+            log(f"[tap] {self.id} sees {src} -> {dest}: {payload} (ttl={ttl})")
+
+            # Entregar al usuario si soy el destino o si es broadcast
+            if dest == self.id or is_broadcast:
+                log(f"[deliver] {self.id} <- {src}: {payload}")
+                # En unicast, si ya entregué (soy destino), no reenvío
+                if not is_broadcast and dest == self.id:
+                    return
+
+            # Reenviar por flooding a todos los vecinos excepto de donde vino
+            fwd = forward_transform(pkt, self.id)
+            if fwd is None:
+                return
+            self.broadcast(fwd, exclude=prev_hop)
             return
 
-        # Forward (rota headers y ttl--)
-        fwd = forward_transform(pkt, self.id)
-        if fwd is None:
-            # si llega aquí normalmente ya lo habríamos contado
-            return
+        # otros tipos: ignorar en flooding puro
 
-        # Reenvía a todos excepto prev_hop
-        self._broadcast_counting(fwd, exclude=prev_hop)
-
-    # -------- consola ----------
+    # --- consola ---
     def _console_loop(self):
         help_text = (
             "Commands:\n"
-            "  send <DEST> <TEXT>   - flood del mensaje; se entrega si logra llegar a DEST\n"
-            "  neighbors            - muestra tus vecinos directos (desde topo)\n"
-            "  stats                - counters: rx/tx/fwd/drop_dup/drop_ttl/drop_cycle/drop_bad\n"
-            "  table                - Flooding no usa tabla de ruteo; muestra vecinos\n"
-            "  ttl <N>              - cambia el TTL por defecto para 'send'\n"
-            "  help                 - muestra este menú\n"
-            "  quit                 - salir\n"
+            "  send <DEST|*> <TEXT> - flooding DATA (unicast o broadcast con '*')\n"
+            "  ttl <N>              - set default TTL\n"
+            "  neighbors            - show my neighbors\n"
+            "  help                 - show help\n"
+            "  quit                 - exit\n"
         )
         log(help_text)
         while True:
@@ -196,46 +168,28 @@ class Node:
                 continue
             parts = raw.split()
             cmd = parts[0].lower()
-
             if cmd == "send" and len(parts) >= 3:
-                dest = parts[1]; text = " ".join(parts[2:])
-                self._send_data(dest, text)
-
-            elif cmd == "neighbors":
-                log(f"Neighbors: {self.neighbors}")
-
-            elif cmd == "stats":
-                s = self.stats
-                log("Stats:")
-                log(f"  rx={s['rx']}  tx={s['tx']}  fwd={s['fwd']}")
-                log(f"  drop_dup={s['drop_dup']}  drop_ttl={s['drop_ttl']}  drop_cycle={s['drop_cycle']}  drop_bad={s['drop_bad']}")
-                log(f"  default_ttl={self.default_ttl}")
-
-            elif cmd == "table":
-                log("Flooding no mantiene tabla de ruteo. Vecinos directos:")
-                for nb in self.neighbors:
-                    log(f"  - {nb}")
-
+                dest = parts[1]
+                text = " ".join(parts[2:])
+                # Soporte broadcast de aplicación con '*' o 'ALL'
+                if dest == "*" or dest.lower() == "all":
+                    dest = "*"
+                pkt = new_message(self.id, dest, text, proto=PROTO_FLOODING, ttl=self.default_ttl)
+                self.broadcast(pkt)
             elif cmd == "ttl" and len(parts) == 2:
                 try:
                     self.default_ttl = int(parts[1]); log(f"default TTL set to {self.default_ttl}")
                 except ValueError:
                     log("ttl must be an integer")
-
+            elif cmd == "neighbors":
+                log(f"neighbors={self.neighbors}")
             elif cmd == "help":
                 log(help_text)
-
             elif cmd == "quit":
                 break
-
             else:
                 log("Unknown command. Type 'help'.")
         self._shutdown()
-
-    def _send_data(self, dest:str, text:str):
-        pkt = new_message(self.id, dest, text, proto=PROTO_FLOODING, ttl=self.default_ttl)
-        # Flood inicial hacia TODOS los vecinos
-        self._broadcast_counting(pkt)
 
     def _shutdown(self):
         log(f"[node] {self.id} shutting down...")
@@ -249,22 +203,19 @@ class Node:
 def main():
     ap = argparse.ArgumentParser(description="Flooding Node (Redis Pub/Sub)")
     ap.add_argument("--id", required=True)
-    ap.add_argument("--topo", required=True, help="Neighbors-only JSON (type=topo)")
-    ap.add_argument("--names", default=None, help="names-redis.json (opcional)")
-    ap.add_argument("--ttl", type=int, default=8)
-    ap.add_argument("--hello", type=float, default=5.0)
+    ap.add_argument("--topo", required=True)
+    ap.add_argument("--names", required=True)
+    ap.add_argument("--ttl", type=int, default=6)
+    ap.add_argument("--hello", type=float, default=10.0)
     ap.add_argument("--redis-host", default="localhost")
     ap.add_argument("--redis-port", type=int, default=6379)
     ap.add_argument("--redis-db", type=int, default=0)
-    ap.add_argument("--redis-pass", default=None)
+    # (El password/host/port también pueden venir desde names; aquí solo van por si quieres override)
     args = ap.parse_args()
 
-    node = Node(args.id, args.topo, names_path=args.names,
-                default_ttl=args.ttl, hello_interval=args.hello,
-                redis_host=args.redis_host, redis_port=args.redis_port,
-                redis_db=args.redis_db, redis_pass=args.redis_pass)
+    node = Node(args.id, args.topo, args.names, args.ttl, args.hello,
+                redis_host=args.redis_host, redis_port=args.redis_port, redis_db=args.redis_db)
     node.start()
-
 
 if __name__ == "__main__":
     main()
