@@ -1,344 +1,185 @@
-import argparse, threading, time, json, os
-from typing import Optional, List, Dict, Any, Tuple
+import argparse, threading, time, json, os, sys
+from typing import Optional, List, Dict, Any
 from utils import log, now_iso, pretty
 from protocols import (
-    new_hello, new_lsp, new_message,
-    sanitize_incoming, forward_transform, ExpiringSet,
-    TYPE_HELLO, TYPE_LSP, TYPE_MESSAGE, TYPE_INFO,
-    PROTO_LSR,
+    new_message, new_hello, sanitize_incoming,
+    TYPE_LSP, TYPE_MESSAGE, TYPE_HELLO, PROTO_LSR
 )
 from transport_redis import RedisTransport
 from config_loader import load_neighbors_only
 from lsr import LSRRouter
 
 
-def load_names_redis(names_path: Optional[str]) -> Tuple[Optional[str], Optional[int], Optional[str], Dict[str,str]]:
-    """
-    Lee names-redis.json para usar host/port/pwd y mapa de canales:
-    {
-      "host": "...", "port": 6379, "pwd": "pass", "type":"names",
-      "config": { "A": {"channel":"net:inbox:A"}, "B": {...} }
-    }
-    """
-    if not names_path:
-        return None, None, None, {}
-    if not os.path.exists(names_path):
-        raise FileNotFoundError(f"names file not found: {names_path}")
-    with open(names_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if data.get("type") != "names":
-        raise ValueError("names file must have type='names'")
-    host = data.get("host")
-    port = data.get("port")
-    pwd  = data.get("pwd")
-    cfg = data.get("config") or {}
-    chmap = {}
-    for nid, val in cfg.items():
-        ch = val.get("channel") if isinstance(val, dict) else None
-        if ch:
-            chmap[str(nid)] = str(ch)
-    return host, port, pwd, chmap
+def links_to_dict_for_print(links_any) -> Dict[str, float]:
+    """ SOLO para imprimir topología (LSDB -> dict); el router NO usa esto. """
+    out: Dict[str, float] = {}
+    if not links_any:
+        return out
+    if isinstance(links_any, dict):
+        for k, v in links_any.items():
+            try:
+                out[str(k)] = float(v)
+            except Exception:
+                out[str(k)] = 1.0
+        return out
+    if isinstance(links_any, list):
+        for it in links_any:
+            if isinstance(it, dict) and "to" in it:
+                try:
+                    out[str(it["to"])] = float(it.get("cost", 1))
+                except Exception:
+                    out[str(it.get("to") or "")] = 1.0
+    return out
+
+
+def headers_to_dict(h) -> Dict[str, Any]:
+    """Convierte headers cualquiera (list/dict/None) a dict aceptable por lsr.py."""
+    if isinstance(h, dict):
+        # ya es dict; garantizamos que 'trail' sea lista si existe
+        d = dict(h)
+        if "trail" in d and not isinstance(d["trail"], list):
+            try:
+                d["trail"] = list(d["trail"])
+            except Exception:
+                d["trail"] = []
+        return d
+    if isinstance(h, list):
+        return {"trail": list(h)}
+    return {}  # fallback
 
 
 class Node:
-    def __init__(self, node_id:str, topo_path:str,
-                 names_path: Optional[str] = None,
-                 metric:str='hop', default_ttl:int=8,
-                 hello_interval:float=5.0, lsp_interval:float=10.0, lsp_max_age:float=60.0,
-                 redis_host:str="localhost", redis_port:int=6379, redis_db:int=0,
-                 redis_pass: Optional[str] = None):
+    def __init__(
+        self, node_id: str, topo_path: str,
+        *, hello_interval: float = 5.0, lsp_interval: float = 10.0,
+        redis_host: str = "localhost", redis_port: int = 6379, redis_db: int = 0,
+        redis_pass: Optional[str] = None, debug: bool = False
+    ):
         self.id = node_id
+        self.debug = debug
         self.neighbors: List[str] = load_neighbors_only(topo_path, self.id)
-
-        # names-redis.json (si existe) tiene prioridad sobre CLI
-        n_host, n_port, n_pwd, chmap = (None, None, None, {})
-        if names_path:
-            try:
-                n_host, n_port, n_pwd, chmap = load_names_redis(names_path)
-            except Exception as e:
-                log(f"[warn] names-redis load failed ({e}); falling back to CLI host/port.")
-
-        host = n_host or redis_host
-        port = n_port or redis_port
-        pwd  = n_pwd  or redis_pass
 
         self.transport = RedisTransport(
             node_id=self.id, on_packet=self._on_packet,
-            host=host, port=port, db=redis_db, password=pwd,
-            channel_map=chmap
+            host=redis_host, port=redis_port, db=redis_db, password=redis_pass
         )
 
-        self.router = LSRRouter(self, metric=metric, lsp_interval=lsp_interval, max_age=lsp_max_age)
+        # Router LSR (usa tu lsr.py)
+        self.router = LSRRouter(self, metric='hop', lsp_interval=lsp_interval, max_age=60.0)
 
-        self.default_ttl = default_ttl
         self.hello_interval = hello_interval
         self.lsp_interval = lsp_interval
+        self.default_ttl = 8
 
         self._hello_stop = threading.Event()
         self._lsp_stop = threading.Event()
-        self.seen = ExpiringSet(ttl_seconds=60)
 
-    # ---------- helpers de normalización ----------
-    @staticmethod
-    def _normalize_links_to_pairs(links_in) -> List[List[Any]]:
-        """
-        Devuelve SIEMPRE [[neighbor, cost], ...]
-        Acepta:
-        - dict: {"B":1,"C":2}
-        - lista de dicts: [{"to":"B","cost":1}, ...]
-        - lista de pares: [["B",1], ["C",2]]
-        - lista de strings: ["B","C"]  -> [["B",1],["C",1]]
-        - None/otros -> []
-        """
-        pairs: List[List[Any]] = []
-        if links_in is None:
-            return pairs
+        # RTT simple por vecino (para --metric rtt si lo habilitas en LSRRouter)
+        self._hello_sent_ts: Dict[str, float] = {}  # nb -> t_sent (monotonic)
+        self._last_rtt_ms: Dict[str, float] = {}    # nb -> rtt en ms
 
-        if isinstance(links_in, dict):
-            for k, v in links_in.items():
-                try:
-                    pairs.append([str(k), int(v)])
-                except Exception:
-                    pairs.append([str(k), 1])
-            return pairs
-
-        if isinstance(links_in, list):
-            if len(links_in) == 0:
-                return pairs
-
-            if isinstance(links_in[0], dict):
-                for d in links_in:
-                    if "to" in d:
-                        try:
-                            pairs.append([str(d["to"]), int(d.get("cost", 1))])
-                        except Exception:
-                            pairs.append([str(d.get("to")), 1])
-                return pairs
-
-            for item in links_in:
-                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    try:
-                        nb, cost = item[0], int(item[1])
-                    except Exception:
-                        nb, cost = item[0], 1
-                    pairs.append([str(nb), cost])
-                elif isinstance(item, str):
-                    pairs.append([item, 1])
-            return pairs
-
-        return pairs
-
-    @staticmethod
-    def _headers_to_dict(headers_list: List[str], prev_hop: Optional[str]) -> Dict[str, Any]:
-        return {"trail": list(headers_list or []), "last_hop": prev_hop}
-
-    # ---------- envío ----------
-    def send_direct(self, neighbor_id:str, pkt:dict):
-        self.transport.publish_packet(neighbor_id, pkt)
-
-    def broadcast(self, pkt:dict, exclude:Optional[str]=None):
-        self.transport.broadcast(self.neighbors, pkt, exclude=exclude)
-
-    # ---------- ciclo de vida ----------
-    def start(self):
-        log(f"[node] {self.id} neighbors={self.neighbors} metric={self.router.metric}")
-        self.transport.start()
-        self._seed_direct_routes()  # rutas base a vecinos
-        time.sleep(1.0)
-        threading.Thread(target=self._hello_loop, name=f"hello-{self.id}", daemon=True).start()
-        threading.Thread(target=self._lsp_loop, name=f"lsp-{self.id}", daemon=True).start()
-        self._console_loop()
-
-    def _seed_direct_routes(self):
-        # Si el router aún no conoce a los vecinos, crea rutas directas (next-hop el propio vecino)
+    # -------- envío de bajo nivel (lo usa el router) --------
+    def send_direct(self, neighbor_id: str, pkt: dict):
+        if self.debug:
+            log(f"[debug:{self.id}] send_direct -> {neighbor_id} type={pkt.get('type')} ttl={pkt.get('ttl')}")
         try:
-            self.router.next_hop  # solo para verificar existe
-        except Exception:
-            # si tu router no tiene estos atributos, crea placeholders
-            self.router.next_hop = {}
-            self.router.dist = {}
-            self.router.paths = {}
-        for nb in self.neighbors:
-            self.router.next_hop.setdefault(nb, nb)
-            self.router.dist.setdefault(nb, 1)
-            self.router.paths.setdefault(nb, [self.id, nb])
-        log(f"[seed] direct routes installed: { {nb: nb for nb in self.neighbors} }")
+            self.transport.publish_packet(neighbor_id, pkt)
+        except Exception as e:
+            log(f"[error] publish to {neighbor_id} failed: {e}")
+
+    # -------- APIs que el router puede llamar --------
+    def on_echo(self, msg: dict):
+        """Llamado por LSRRouter cuando llega un ECHO de respuesta a un HELLO (mide RTT)."""
+        sender = str(msg.get("from"))
+        t0 = self._hello_sent_ts.pop(sender, None)
+        if t0 is not None:
+            rtt_ms = (time.monotonic() - t0) * 1000.0
+            self._last_rtt_ms[sender] = rtt_ms
+            if self.debug:
+                log(f"[debug:{self.id}] RTT {sender} ≈ {rtt_ms:.1f} ms")
+
+    def last_rtt(self, neighbor_id: str) -> Optional[float]:
+        """ Devuelve el último RTT (ms) estimado al vecino. Usado si metric='rtt'. """
+        return self._last_rtt_ms.get(neighbor_id)
+
+    # -------- ciclo de vida --------
+    def start(self):
+        log(f"[node] {self.id} up | neighbors={self.neighbors} | metric={self.router.metric}")
+        try:
+            self.transport.start()
+        except Exception as e:
+            log(f"[fatal] transport start failed: {e}")
+            raise
+
+        # Hilos: HELLO y LSP del router
+        threading.Thread(target=self._hello_loop, name=f"hello-{self.id}", daemon=True).start()
+        threading.Thread(target=self._lsp_loop,   name=f"lsp-{self.id}",   daemon=True).start()
+
+        self._console_loop()
 
     def _hello_loop(self):
         while not self._hello_stop.is_set():
             pkt = new_hello(self.id, proto=PROTO_LSR, ttl=2)
-            self.broadcast(pkt)
+            # Enviar HELLO directo a cada vecino y registrar ts para RTT
+            for nb in self.neighbors:
+                self._hello_sent_ts[nb] = time.monotonic()
+                self.send_direct(nb, pkt)
             self._hello_stop.wait(self.hello_interval)
 
     def _lsp_loop(self):
-        time.sleep(1.0)
-        self._originate_lsp()
+        # Origina un LSP pronto para acelerar convergencia
+        time.sleep(0.5)
+        self.router.originate_lsp()
         while not self._lsp_stop.is_set():
             self._lsp_stop.wait(self.lsp_interval)
-            if self._lsp_stop.is_set(): break
-            self._originate_lsp()
+            if self._lsp_stop.is_set():
+                break
+            self.router.originate_lsp()
 
-    # ---------- construir LSP propio ----------
-    def _build_lsp_payload(self) -> Dict[str, Any]:
-        # Enviamos como dict { vecino: costo }, lo normalizamos antes de entrar al router
-        links_dict: Dict[str, int] = {}
-        for nb in self.neighbors:
-            cost = 1 if self.router.metric == "hop" else (getattr(self.router, "rtt", lambda _ : 1)(nb) or 1)
-            try:
-                cost = int(cost)
-            except Exception:
-                cost = 1
-            links_dict[nb] = cost
-        return {"id": self.id, "links": links_dict, "ts": now_iso()}
-
-    def _originate_lsp(self):
-        lsp_payload = self._build_lsp_payload()
-        pkt = new_lsp(self.id, lsp_payload, ttl=5)
-        self._consume_control(pkt, incoming_last_hop=self.id)  # integra local
-        self.broadcast(pkt)  # difunde
-
-    # ---------- recepción ----------
-    def _on_packet(self, pkt:dict, _src:str):
-        # Normaliza paquetitos “raros” del otro programa
+    # -------- recepción desde Redis --------
+    def _on_packet(self, pkt: dict, _src: str):
         try:
             pkt = sanitize_incoming(pkt)
         except Exception as e:
-            log(f"[drop] sanitize failed: {e}; raw={pretty(pkt)}")
+            if self.debug:
+                log(f"[debug:{self.id}] sanitize_incoming failed: {e}")
             return
 
-        mid = pkt.get("msg_id")
-        if mid and not self.seen.add_if_new(mid):
-            return
+        # Asegura un 'id' para deduplicación del router (este usa msg["id"])
+        if "id" not in pkt and "msg_id" in pkt:
+            pkt["id"] = pkt["msg_id"]
 
-        ptype = pkt.get("type")
-        dest  = pkt.get("to")
-        headers_list = pkt.get("headers", [])
-        prev_hop = headers_list[-1] if headers_list else None
-
-        if ptype == TYPE_HELLO:
-            # asegura ruta directa (por si no estaba)
-            frm = pkt.get("from")
-            if frm in self.neighbors:
-                if getattr(self.router, "next_hop", None) is not None:
-                    self.router.next_hop.setdefault(frm, frm)
-                    self.router.dist.setdefault(frm, 1)
-            return
-
-        if ptype == TYPE_INFO:
-            # Interoperabilidad: INFO del otro programa (DV/LSR) -> convertir a LSP canónico
-            self._handle_info_as_lsp(pkt, prev_hop)
-            return
-
-        if ptype == TYPE_LSP:
-            self._consume_control(pkt, incoming_last_hop=prev_hop)
-            fwd = forward_transform(pkt, self.id)
-            if fwd is not None:
-                self.broadcast(fwd, exclude=prev_hop)
-            return
-
-        if ptype == TYPE_MESSAGE:
-            if dest == self.id:
-                log(f"[deliver] {self.id} <- {pkt.get('from')}: {pkt.get('payload')}")
-                return
-            nh = getattr(self.router, "next_hop", {}).get(dest)
-            if not nh:
-                log(f"[drop] no route {self.id}->{dest}")
-                return
-            fwd = forward_transform(pkt, self.id)
-            if fwd is None:
-                return
-            self.send_direct(nh, fwd)
-            return
-
-    def _handle_info_as_lsp(self, pkt: dict, prev_hop: Optional[str]):
-        """
-        Acepta INFO del router externo:
-        payload puede venir como str JSON o dict con campos:
-          {"origin":"B","neighbors":{"A":1,...},"seq":N,"ts":...}
-        Lo convertimos a un LSP: {"id":"B","links":[["A",1],...]}
-        y lo pasamos por el mismo flujo que un LSP normal.
-        """
-        pl = pkt.get("payload")
-        info: Dict[str, Any] = {}
-        if isinstance(pl, str):
-            try:
-                info = json.loads(pl)
-            except Exception:
-                return
-        elif isinstance(pl, dict):
-            info = pl
+        # Calcula last_hop del valor original y luego normaliza headers a dict
+        h_orig = pkt.get("headers", [])
+        if isinstance(h_orig, list) and h_orig:
+            last_hop = h_orig[-1]
+        elif isinstance(h_orig, dict):
+            last_hop = h_orig.get("last_hop")
         else:
-            return
+            last_hop = None
+        pkt["headers"] = headers_to_dict(h_orig)
 
-        origin = info.get("origin") or pkt.get("from")
-        links_in = info.get("neighbors") or info.get("links") or {}
-        links_pairs = self._normalize_links_to_pairs(links_in)
+        if self.debug:
+            log(f"[debug:{self.id}] on_packet type={pkt.get('type')} from={pkt.get('from')} ttl={pkt.get('ttl')} last_hop={last_hop}")
 
-        fake_lsp = {
-            "proto": "lsr",
-            "type": TYPE_LSP,
-            "from": origin,
-            "to": "broadcast",
-            "ttl": int(pkt.get("ttl", 5)),
-            "headers": pkt.get("headers", []),  # lista; _consume_control la convertirá a dict para el router
-            "payload": {"id": origin, "links": links_pairs, "ts": info.get("ts", now_iso())},
-            "msg_id": pkt.get("msg_id"),
-        }
-        self._consume_control(fake_lsp, incoming_last_hop=prev_hop)
-
-    def _consume_control(self, pkt:dict, incoming_last_hop:Optional[str]):
-        """
-        Compatibilidad con tu LSRRouter:
-        - Asegura top-level 'id'
-        - Convierte 'links' a lista de pares [[vecino, costo], ...]
-        - Convierte headers list -> dict {'trail': [...], 'last_hop': ...}
-        """
+        # Pasa TODO al router tal cual (él sabe manejar LSP/MSG/HELLO/ECHO)
         try:
-            if pkt.get("type") == TYPE_LSP:
-                pl = pkt.get("payload") or {}
-                legacy = dict(pkt)  # copia superficial
-
-                # ID toplevel
-                legacy["id"] = legacy.get("id") or pl.get("id") or pkt.get("from") or self.id
-
-                # Fuente de links (payload > toplevel) y normalización a lista de pares
-                links_in = pl.get("links", pkt.get("links"))
-                links_pairs = self._normalize_links_to_pairs(links_in)
-
-                # headers: tu router espera dict
-                headers_dict = self._headers_to_dict(pkt.get("headers", []), incoming_last_hop)
-                # (solo para debug limpio)
-                sample = dict(list(headers_dict.items())[:2])
-                log(f"[debug:before-router] pkt.type={pkt.get('type')} from={pkt.get('from')} to={pkt.get('to')} ttl={pkt.get('ttl')}")
-                log(f"[debug:before-router] payload.keys={list(pl.keys())}")
-                log(f"[debug:before-router] raw_links_type={'list' if isinstance(links_in, list) else 'dict' if isinstance(links_in, dict) else type(links_in).__name__} "
-                    f"sample={links_in if isinstance(links_in, dict) else (links_in[:1] if isinstance(links_in, list) else links_in)}")
-                log(f"[debug:before-router] legacy.id={legacy['id']} links_dict.size={len(dict(links_pairs))} sample={list(dict(links_pairs).items())[:1]}")
-                log(f"[debug:before-router] headers_dict.keys={list(headers_dict.keys())} sample={sample}")
-
-                # Espeja formato canónico que tu LSRRouter sabe digerir
-                legacy["headers"] = headers_dict
-                legacy["links"] = links_pairs
-                legacy["payload"] = {"id": legacy["id"], "links": links_pairs, "ts": (pl.get("ts") or now_iso())}
-
-                # Al router
-                self.router.on_receive(legacy, incoming_last_hop)
-            else:
-                self.router.on_receive(pkt, incoming_last_hop)
-
+            self.router.on_receive(pkt, last_hop)
         except Exception as e:
-            log(f"[ERROR] router.on_receive raised: {e}\n[ERROR] offending packet = {pretty(pkt)}")
+            log(f"[error] router.on_receive failed: {e}")
 
-    # ---------- consola ----------
+    # -------- consola --------
     def _console_loop(self):
         help_text = (
             "Commands:\n"
-            "  send <DEST> <TEXT>   - send DATA via LSR (next-hop)\n"
-            "  table                - print routing table (next-hop, cost)\n"
-            "  route <DEST>         - show SPF path\n"
-            "  lsdb                 - print LSDB\n"
-            "  ttl <N>              - set default TTL\n"
-            "  lsp                  - originate LSP now\n"
+            "  send <DEST> <TEXT>   - send DATA via LSR (router)\n"
+            "  table                - routing table (next-hop, cost)\n"
+            "  route <DEST>         - SPF path\n"
+            "  topo                 - topology from LSDB (adjacency + edges)\n"
+            "  graph                - DOT graph (copy to Graphviz)\n"
+            "  lsdb                 - print LSDB (raw)\n"
+            "  ttl <N>              - set default TTL for messages\n"
+            "  lsp                  - originate LSP now (router)\n"
             "  help                 - show help\n"
             "  quit                 - exit\n"
         )
@@ -352,98 +193,165 @@ class Node:
                 continue
             parts = raw.split()
             cmd = parts[0].lower()
+
             if cmd == "send" and len(parts) >= 3:
                 dest = parts[1]; text = " ".join(parts[2:])
                 self._send_data(dest, text)
+
             elif cmd == "table":
                 self._print_table()
+
             elif cmd == "route" and len(parts) == 2:
                 self._print_route(parts[1])
+
             elif cmd == "lsdb":
                 try:
-                    log(pretty(self.router.lsdb.as_dict()))
+                    d = self.router.lsdb.as_dict()
+                    log(pretty(d))
                 except Exception:
                     log("[warn] LSDB not available")
+
+            elif cmd == "topo":
+                self._print_topology()
+
+            elif cmd == "graph":
+                self._print_graph_dot()
+
             elif cmd == "ttl" and len(parts) == 2:
                 try:
-                    self.default_ttl = int(parts[1]); log(f"default TTL set to {self.default_ttl}")
+                    self.default_ttl = int(parts[1]); log(f"[cfg] TTL={self.default_ttl}")
                 except ValueError:
-                    log("ttl must be an integer")
+                    log("[warn] ttl must be integer")
+
             elif cmd == "lsp":
-                self._originate_lsp()
+                self.router.originate_lsp()
+
             elif cmd == "help":
                 log(help_text)
+
             elif cmd == "quit":
                 break
+
             else:
                 log("Unknown command. Type 'help'.")
         self._shutdown()
 
-    def _send_data(self, dest:str, text:str):
-        if dest == self.id:
-            log("[info] destination is self; printing locally: " + text)
-            return
-
-        nh = getattr(self.router, "next_hop", {}).get(dest)
-
-        # --- FAIL-SAFE: si no hay ruta pero es vecino directo, usa el vecino ---
-        if not nh and dest in self.neighbors:
-            nh = dest
-            log(f"[fallback] using direct neighbor {dest} as next-hop")
-
-        if not nh:
-            log(f"[drop] no route {self.id}->{dest}")
-            return
-
+    # -------- helpers de consola --------
+    def _send_data(self, dest: str, text: str):
         pkt = new_message(self.id, dest, text, proto=PROTO_LSR, ttl=self.default_ttl)
-        self.send_direct(nh, pkt)
-
+        # Igual que en recepción: asegura 'id' y headers en dict antes del router
+        pkt["id"] = pkt.get("msg_id")
+        pkt["headers"] = headers_to_dict(pkt.get("headers"))
+        try:
+            self.router.on_receive(pkt, None)
+        except Exception as e:
+            log(f"[error] router.on_receive(message) failed: {e}")
 
     def _print_table(self):
+        table = getattr(self.router, "next_hop", {})
+        if not table:
+            log("[warn] routing table empty (aún no hay LSPs válidos)")
+            return
         log("Routing table (next-hop | cost):")
-        try:
-            for d, nh in sorted(getattr(self.router, "next_hop", {}).items()):
-                cost = getattr(self.router, "dist", {}).get(d, "?")
-                log(f"  {self.id}->{d} : next-hop={nh} cost={cost}")
-        except Exception:
-            log("[warn] routing table not available yet")
+        for d in sorted(table.keys()):
+            nh = table[d]
+            cost = getattr(self.router, "dist", {}).get(d, "?")
+            log(f"  {self.id}->{d} : next-hop={nh} cost={cost}")
 
-    def _print_route(self, dest:str):
+    def _print_route(self, dest: str):
+        path = getattr(self.router, "paths", {}).get(dest, [])
+        log(" -> ".join(path) if path else f"[no-path] {self.id}->{dest}")
+
+    def _print_topology(self):
         try:
-            path = getattr(self.router, "paths", {}).get(dest, [])
-            log(" -> ".join(path) if path else f"[no-path] {self.id}->{dest}")
+            lsdb = self.router.lsdb.as_dict()
         except Exception:
-            log("[warn] no path data yet")
+            log("[warn] LSDB not available")
+            return
+        if not isinstance(lsdb, dict) or not lsdb:
+            log("[warn] no topology yet")
+            return
+
+        log("Topology (adjacency):")
+        for nid in sorted(lsdb.keys()):
+            rec = lsdb[nid]
+            if nid in ("null", None) or not isinstance(rec, dict):
+                continue
+            links = links_to_dict_for_print(rec.get("links", {}))
+            nbs = list(links.keys())
+            log(f"  {nid}: {', '.join(nbs) if nbs else '-'}")
+
+        log("Edges (undirected, deduped):")
+        printed = set()
+        for a in sorted(k for k in lsdb.keys() if k not in ("null", None)):
+            links_a = links_to_dict_for_print(lsdb[a].get("links", {}))
+            for b, cost in links_a.items():
+                edge = tuple(sorted((a, b)))
+                if edge in printed or a == b:
+                    continue
+                links_b = links_to_dict_for_print(lsdb.get(b, {}).get("links", {}))
+                opp = links_b.get(a)
+                if opp is not None and opp != cost:
+                    log(f"  {edge[0]} -- {edge[1]} (cost {cost}/{opp})")
+                else:
+                    log(f"  {edge[0]} -- {edge[1]} (cost {cost})")
+                printed.add(edge)
+
+    def _print_graph_dot(self):
+        try:
+            lsdb = self.router.lsdb.as_dict()
+        except Exception:
+            log("[warn] LSDB not available")
+            return
+        edges = set()
+        nodes = set(k for k in lsdb.keys() if k not in ("null", None))
+        for a in nodes:
+            links = links_to_dict_for_print(lsdb[a].get("links", {}))
+            for b, cost in links.items():
+                edge = tuple(sorted((a, b)))
+                edges.add((edge[0], edge[1], cost))
+        lines = ["graph G {"]
+        for n in sorted(nodes):
+            lines.append(f'  "{n}";')
+        for a, b, cost in sorted(edges):
+            lines.append(f'  "{a}" -- "{b}" [label="{cost}"];')
+        lines.append("}")
+        log("\n".join(lines))
 
     def _shutdown(self):
-        log(f"[node] {self.id} shutting down...")
         self._hello_stop.set(); self._lsp_stop.set()
-        try: self.transport.stop()
-        except: pass
+        try:
+            self.transport.stop()
+        except Exception:
+            pass
+        log(f"[node] {self.id} down")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="LSR Node (Redis Pub/Sub)")
+    ap = argparse.ArgumentParser(description="LSR Node (Redis Pub/Sub) compatible con lsr.py")
     ap.add_argument("--id", required=True)
-    ap.add_argument("--topo", required=True, help="Neighbors-only JSON (type=topo)")
-    ap.add_argument("--names", default=None, help="names-redis.json (opcional)")
-    ap.add_argument("--metric", choices=["hop","rtt"], default="hop")
-    ap.add_argument("--ttl", type=int, default=8)
+    ap.add_argument("--topo", required=True)
     ap.add_argument("--hello", type=float, default=5.0)
     ap.add_argument("--lsp", type=float, default=10.0)
-    ap.add_argument("--maxage", type=float, default=60.0)
     ap.add_argument("--redis-host", default="localhost")
     ap.add_argument("--redis-port", type=int, default=6379)
     ap.add_argument("--redis-db", type=int, default=0)
     ap.add_argument("--redis-pass", default=None)
+    ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
-    node = Node(args.id, args.topo, names_path=args.names, metric=args.metric,
-                default_ttl=args.ttl, hello_interval=args.hello,
-                lsp_interval=args.lsp, lsp_max_age=args.maxage,
-                redis_host=args.redis_host, redis_port=args.redis_port,
-                redis_db=args.redis_db, redis_pass=args.redis_pass)
-    node.start()
+    try:
+        node = Node(
+            args.id, args.topo,
+            hello_interval=args.hello, lsp_interval=args.lsp,
+            redis_host=args.redis_host, redis_port=args.redis_port,
+            redis_db=args.redis_db, redis_pass=args.redis_pass,
+            debug=args.debug
+        )
+        node.start()
+    except Exception as e:
+        log(f"[fatal] node crashed during start: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
