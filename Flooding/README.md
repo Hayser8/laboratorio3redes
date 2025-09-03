@@ -61,6 +61,7 @@ python3 node.py --id C --topo topo-sample.json --names names-sample.json
 py node.py --id C --topo topo-sample.json --names names-sample.json
 
 - Clase
+.\.venv\Scripts\Activate.ps1
 python .\node.py --id C --topo .\topo-compat.json --names .\names-redis.json
 ```
 
