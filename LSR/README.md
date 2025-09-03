@@ -28,6 +28,11 @@ cd lsr-routing
 python3 node.py --id C --topo topo-sample.json --names names-sample.json --metric hop
 ```
 
+- Clase
+```bash
+python node.py --id A --topo topo.json --names names-redis.json --debug
+
+```
 ### Comandos
 ```
 send <DEST> <TEXTO>

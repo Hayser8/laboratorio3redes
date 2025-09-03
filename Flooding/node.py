@@ -1,6 +1,6 @@
 # Flooding/node.py
 import argparse, threading, time, json
-from typing import Optional, List
+from typing import Optional, List, Dict
 from utils import log
 from protocols import (
     new_hello, new_message,
@@ -11,10 +11,10 @@ from transport_redis import RedisTransport
 
 
 # ----------------------------
-# Helpers locales (sin depender de config_loader)
+# Helpers (no depende de config_loader)
 # ----------------------------
 def load_neighbors_only(topo_path: str, my_id: str) -> List[str]:
-    """Lee el topo JSON y devuelve SOLO la lista de vecinos de my_id."""
+    """Lee topo-*.json y devuelve SOLO la lista de vecinos de my_id."""
     with open(topo_path, "r", encoding="utf-8") as f:
         obj = json.load(f)
     assert obj.get("type") == "topo", "topology file must have type=topo"
@@ -22,16 +22,15 @@ def load_neighbors_only(topo_path: str, my_id: str) -> List[str]:
     neighs = cfg.get(my_id, [])
     return list(neighs.keys() if isinstance(neighs, dict) else neighs)
 
-def load_names_meta(names_path: str) -> dict:
+
+def load_names_meta(names_path: str) -> Dict:
     """
-    Lee names-*.json y retorna metadatos de Redis si existen.
-    Formatos soportados:
-      {
-        "type": "names",
-        "host": "...", "port": 6379, "pwd": ".....",
-        "config": { "A": {"channel": "..."}, ... }
-      }
-    Si no hay host/port/pwd, retorna dict vacío (no rompe nada).
+    Lee names-*.json y retorna metadatos de Redis + channel_map:
+    {
+      "type": "names",
+      "host": "...", "port": 6379, "pwd": ".....",
+      "config": { "A": {"channel": "..."}, ... }
+    }
     """
     with open(names_path, "r", encoding="utf-8") as f:
         obj = json.load(f)
@@ -40,12 +39,13 @@ def load_names_meta(names_path: str) -> dict:
     if "host" in obj: meta["host"] = obj["host"]
     if "port" in obj: meta["port"] = obj["port"]
     if "pwd"  in obj: meta["pwd"]  = obj["pwd"]
-    # si te interesa el canal de tu ID, podrías leerlo aquí:
-    meta["channels"] = {}
+    # channel_map id->canal (si existe)
+    chmap: Dict[str, str] = {}
     cfg = obj.get("config", {})
     for nid, entry in cfg.items():
         if isinstance(entry, dict) and "channel" in entry:
-            meta["channels"][nid] = entry["channel"]
+            chmap[str(nid)] = str(entry["channel"])
+    meta["channels"] = chmap
     return meta
 
 
@@ -59,22 +59,24 @@ class Node:
         # Metadatos de Redis (si existen en names)
         self.redis_meta = load_names_meta(names_path)
 
-        # Resolver parámetros de conexión a Redis
+        # Resolver conexión a Redis (names tiene prioridad, CLI como fallback)
         host = self.redis_meta.get("host", redis_host)
         port = int(self.redis_meta.get("port", redis_port))
         password = self.redis_meta.get("pwd", None)
+        chmap = self.redis_meta.get("channels", {})  # id -> canal exacto
 
-        # Crear transporte Redis (tolerante a firma de constructor)
-        tx = None
-        try:
-            # firma completa (si tu transport la soporta)
-            tx = RedisTransport(node_id=self.id, on_packet=self._on_packet,
-                                host=host, port=port, db=redis_db, password=password)
-        except TypeError:
-            # firma simple (sin password)
-            tx = RedisTransport(node_id=self.id, on_packet=self._on_packet,
-                                host=host, port=port, db=redis_db)
-        self.transport = tx
+        # Crear transporte Redis (con channel_map + logs)
+        self.transport = RedisTransport(
+            node_id=self.id,
+            on_packet=self._on_packet,
+            host=host,
+            port=port,
+            db=redis_db,
+            password=password,
+            channel_map=chmap,
+            on_log=log,
+            on_error=self._on_transport_error,
+        )
 
         self.default_ttl = default_ttl
         self.hello_interval = hello_interval
@@ -94,6 +96,10 @@ class Node:
     def start(self):
         log(f"[node] {self.id} neighbors={self.neighbors} (flooding)")
         self.transport.start()
+        # Hint útil de depuración cuando todos comparten canal:
+        if self.redis_meta.get("channels"):
+            sample = list(self.redis_meta["channels"].items())[:5]
+            log(f"[node] channel_map sample: {sample}")
         threading.Thread(target=self._hello_loop, name=f"hello-{self.id}", daemon=True).start()
         self._console_loop()
 
@@ -128,7 +134,7 @@ class Node:
             return
 
         if ptype == TYPE_MESSAGE:
-            # === Requisito: que se vea en TODOS los nodos por donde pasa ===
+            # --- Requisito: que se vea en TODOS los nodos por donde pasa ---
             is_broadcast = (dest in ("*", None))
             log(f"[tap] {self.id} sees {src} -> {dest}: {payload} (ttl={ttl})")
 
@@ -147,6 +153,12 @@ class Node:
             return
 
         # otros tipos: ignorar en flooding puro
+
+    def _on_transport_error(self, exc: Exception, raw: Optional[str]):
+        try:
+            log(f"[transport-error] {exc} raw={raw!r}")
+        except Exception:
+            pass
 
     # --- consola ---
     def _console_loop(self):
@@ -210,7 +222,7 @@ def main():
     ap.add_argument("--redis-host", default="localhost")
     ap.add_argument("--redis-port", type=int, default=6379)
     ap.add_argument("--redis-db", type=int, default=0)
-    # (El password/host/port también pueden venir desde names; aquí solo van por si quieres override)
+    # Nota: host/port/password se leen de names-redis.json; los CLI sirven como fallback.
     args = ap.parse_args()
 
     node = Node(args.id, args.topo, args.names, args.ttl, args.hello,

@@ -1,10 +1,13 @@
 {
-  "type": "names",
-  "host": "127.0.0.1",
+  "host": "lab3.redesuvg.cloud",
   "port": 6379,
-  "pwd": "",
+  "pwd": "UVGRedis2025",
+  "type": "names",
   "config": {
-    "A": { "channel": "net:inbox:A" },
-    "B": { "channel": "net:inbox:B" }
+    "A": { "channel": "sec20.topologia1.node1" },
+    "B": { "channel": "sec20.topologia1.node2" },
+    "C": { "channel": "sec20.topologia1.node3" },
+    "D": { "channel": "sec20.topologia1.node4" },
+    "E": { "channel": "sec20.topologia1.node5" }
   }
 }

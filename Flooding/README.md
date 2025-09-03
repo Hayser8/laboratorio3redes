@@ -60,6 +60,8 @@ cd flooding-routing
 python3 node.py --id C --topo topo-sample.json --names names-sample.json
 py node.py --id C --topo topo-sample.json --names names-sample.json
 
+- Clase
+python .\node.py --id C --topo .\topo-compat.json --names .\names-redis.json
 ```
 
 ### Send a message (from any node's interactive prompt)
