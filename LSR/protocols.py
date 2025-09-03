@@ -1,6 +1,4 @@
 """
-protocols.py — Estándar JSON de mensajes + utilidades comunes.
-
 Formato JSON (v1):
 {
   "proto":   "dijkstra|flooding|lsr|dvr",
@@ -19,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import uuid
 import time
 
-# ---- Constantes
+# ---- Constantes de protocolo
 PROTO_DIJKSTRA = "dijkstra"
 PROTO_FLOODING = "flooding"
 PROTO_LSR      = "lsr"
@@ -57,8 +55,11 @@ def _extract_trail_from_headers_maybe_dict(hval: Any) -> List[str]:
         return normalize_headers(hval)
     if isinstance(hval, dict):
         trail = hval.get("trail")
+        path  = hval.get("path")
         if isinstance(trail, list):
             return normalize_headers(trail)
+        if isinstance(path, list):
+            return normalize_headers(path)
         return []
     return []
 
@@ -78,7 +79,7 @@ def decrement_ttl(ttl: Optional[int]) -> int:
         return 0
     return max(int(ttl) - 1, 0)
 
-# ---- Builders
+# ---- Builders (siempre dejan headers como LISTA en “wire”)
 def build_packet(
     *, proto: str, ptype: str, from_id: str, to: str, ttl: int,
     headers: Optional[Iterable[str]] = None, payload: Any = None,
@@ -100,7 +101,7 @@ def new_hello(self_id: str, *, proto: str = PROTO_LSR, ttl: int = DEFAULT_TTL_IN
                         ttl=ttl, headers=[self_id], payload={})
 
 def new_info(self_id: str, payload: Dict[str, Any], *,
-             proto: str = PROTO_DVR, ttl: int = DEFAULT_TTL_INFO,
+             proto: str = PROTO_LSR, ttl: int = DEFAULT_TTL_INFO,
              headers: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     return build_packet(proto=proto, ptype=TYPE_INFO, from_id=self_id, to=BROADCAST,
                         ttl=ttl, headers=(headers or [self_id]), payload=payload)
@@ -117,7 +118,7 @@ def new_message(self_id: str, dest_id: str, data: Any, *,
     return build_packet(proto=proto, ptype=TYPE_MESSAGE, from_id=self_id, to=dest_id,
                         ttl=ttl, headers=(headers or [self_id]), payload=data)
 
-# ---- Validación
+# ---- Validación / saneamiento de entrada
 REQUIRED_FIELDS = ("proto", "type", "from", "to", "ttl", "headers", "payload", "msg_id")
 
 def is_valid_packet(pkt: Dict[str, Any]) -> Tuple[bool, str]:
@@ -126,9 +127,7 @@ def is_valid_packet(pkt: Dict[str, Any]) -> Tuple[bool, str]:
     for k in REQUIRED_FIELDS:
         if k not in pkt:
             return False, f"missing-field:{k}"
-    # headers puede ser lista o dict
-    h = pkt["headers"]
-    if not isinstance(h, (list, dict)):
+    if not isinstance(pkt.get("headers"), (list, dict)):
         return False, "headers-bad-type"
     try:
         int(pkt["ttl"])
@@ -136,80 +135,50 @@ def is_valid_packet(pkt: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "ttl-not-int"
     return True, "ok"
 
-REQUIRED_FIELDS = ("proto", "type", "from", "to", "ttl", "headers", "payload", "msg_id")
-
 def sanitize_incoming(pkt: Dict[str, Any]) -> Dict[str, Any]:
-    # Acepta paquetes medio "sucios" y los normaliza.
+    """
+    Acepta paquetes “ensuciados” y los normaliza a nuestro wire-format (headers LIST).
+    No hace verificaciones de semántica, sólo estructura básica.
+    """
     if not isinstance(pkt, dict):
         raise ValueError("invalid-packet-structure")
 
-    # Normaliza campos básicos (pueden no existir aún)
+    # Normaliza tipos básicos
     if "proto" in pkt:   pkt["proto"] = str(pkt["proto"])
     if "type"  in pkt:   pkt["type"]  = str(pkt["type"])
     if "from"  in pkt:   pkt["from"]  = str(pkt["from"])
     if "to"    in pkt:   pkt["to"]    = str(pkt["to"])
     if "ttl"   in pkt:   pkt["ttl"]   = int(pkt["ttl"])
 
-    # -- headers: aceptar list o dict
+    # headers: permitir list o dict -> convertir a LIST
     h = pkt.get("headers")
-    headers_list: List[str] = []
-    if isinstance(h, list):
-        headers_list = normalize_headers(h)
-    elif isinstance(h, dict):
-        # extrae trail o path si existen
-        trail = h.get("trail")
-        path  = h.get("path")
-        if isinstance(trail, list):
-            headers_list = normalize_headers(trail)
-        elif isinstance(path, list):
-            headers_list = normalize_headers(path)
-        else:
-            headers_list = []
-    elif h is None:
-        headers_list = []
-    else:
-        # tipo raro
-        headers_list = []
+    pkt["headers"] = _extract_trail_from_headers_maybe_dict(h)
 
-    pkt["headers"] = headers_list
-
-    # -- msg_id: si falta arriba, tomar de headers.msg_id; si no hay, generar
+    # msg_id: si falta, generar (o copiar de headers.dict si venía allí)
     if "msg_id" not in pkt or not pkt.get("msg_id"):
         hid = None
         if isinstance(h, dict):
             hid = h.get("msg_id")
         pkt["msg_id"] = str(hid) if hid else make_msg_id()
 
-    # -- payload: si falta, dejar dict vacío (permitimos str también)
+    # payload por defecto
     if "payload" not in pkt:
         pkt["payload"] = {}
 
-    # -- Defaults por si venían ausentes
-    pkt.setdefault("proto", "lsr")
-    pkt.setdefault("type",  "message")
+    # Defaults por si venían ausentes
+    pkt.setdefault("proto", PROTO_LSR)
+    pkt.setdefault("type",  TYPE_MESSAGE)
     pkt.setdefault("from",  "?")
-    pkt.setdefault("to",    "broadcast")
-    pkt["ttl"] = int(pkt.get("ttl", 5))
+    pkt.setdefault("to",    BROADCAST)
+    pkt["ttl"] = int(pkt.get("ttl", DEFAULT_TTL_INFO))
 
-    # Validación final (ya normalizado)
+    # Validación final
     for k in REQUIRED_FIELDS:
         if k not in pkt:
-            raise ValueError(f"invalid-packet-structure")
+            raise ValueError("invalid-packet-structure")
     return pkt
 
-def forward_transform(pkt: Dict[str, Any], self_id: str) -> Optional[Dict[str, Any]]:
-    if should_drop_for_cycle(self_id, pkt.get("headers")):
-        return None
-    new_ttl = decrement_ttl(pkt.get("ttl"))
-    if new_ttl <= 0:
-        return None
-    new_headers = rotate_headers(pkt.get("headers"), self_id, HEADERS_MAXLEN)
-    new_pkt = dict(pkt)
-    new_pkt["ttl"] = new_ttl
-    new_pkt["headers"] = new_headers
-    return new_pkt
-
-# ---- Anti-duplicados
+# ---- Anti-duplicados simple
 class ExpiringSet:
     def __init__(self, ttl_seconds: int = 60):
         self.ttl = int(ttl_seconds)

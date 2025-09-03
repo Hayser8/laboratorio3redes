@@ -24,13 +24,12 @@ class LSDB:
             self.db.pop(o, None)
 
     def graph(self) -> Dict[str, Dict[str, float]]:
+        # DIRIGIDO: solo origin -> nb (no duplicar aristas en ambos sentidos)
         g: Dict[str, Dict[str, float]] = {}
         for origin, rec in self.db.items():
             g.setdefault(origin, {})
             for nb, cost in rec['links'].items():
-                g.setdefault(nb, {})
-                g[origin][nb] = float(cost)
-                g[nb].setdefault(origin, float(cost))
+                g[origin][str(nb)] = float(cost)
         return g
 
     def as_dict(self) -> Dict:
@@ -57,8 +56,10 @@ class LSRRouter:
             else:
                 cost = 1.0
             links[nb] = cost
-        payload = {"origin": self.node.id, "seq": self.seq, "links": [{"to": k, "cost": v} for k,v in links.items()]}
-        msg = build_message(PROTO_LSR, TYPE_LSP, self.node.id, "*", ttl=16, payload=payload, headers={"ts": now_iso()})
+        payload = {"origin": self.node.id, "seq": self.seq,
+                   "links": [{"to": k, "cost": v} for k,v in links.items()]}
+        msg = build_message(PROTO_LSR, TYPE_LSP, self.node.id, "*", ttl=16,
+                            payload=payload, headers={"ts": now_iso()})
         changed = self._apply_lsp_message(msg)
         if changed:
             self._run_spf()
@@ -87,6 +88,9 @@ class LSRRouter:
         fwd["ttl"] = msg["ttl"] - 1
         headers = dict(fwd.get("headers") or {})
         headers["last_hop"] = self.node.id
+        trail = list(headers.get("trail", []))
+        trail = (trail + [self.node.id])[-3:]
+        headers["trail"] = trail
         fwd["headers"] = headers
         for nb in self.node.neighbors:
             if nb == exclude:
@@ -108,14 +112,40 @@ class LSRRouter:
                 return
             if ttl <= 0:
                 return
-            nh = self.next_hop.get(msg["to"])
+
+            dest = msg.get("to")
+            nh = self.next_hop.get(dest)
+
+            # Atajo: si es vecino directo
+            if nh is None and dest in getattr(self.node, "neighbors", []):
+                nh = dest
+
+            # Fallback para transitividad cuando el origen aún no aprendió rutas:
+            # - evita eco al que lo envió (incoming_neighbor)
+            # - usa un vecino determinístico
+            if nh is None:
+                nbs = [n for n in self.node.neighbors if n != incoming_neighbor]
+                if nbs:
+                    nh = sorted(nbs)[0]  # determinista
+
             if not nh:
-                log(f"[drop] no route from {self.node.id} to {msg['to']}")
+                log(f"[drop] no route from {self.node.id} to {dest}")
                 return
+
             fwd = dict(msg)
             fwd["ttl"] = ttl - 1
             headers = dict(fwd.get("headers") or {})
             headers["last_hop"] = self.node.id
+
+            # ---- FIX: anti-bucle correcto ----
+            # Solo descartamos si ya nos vimos en el trail y el paquete VIENE de la red.
+            trail = list(headers.get("trail", []))
+            if incoming_neighbor is not None and self.node.id in trail:
+                return
+            trail = (trail + [self.node.id])[-3:]
+            headers["trail"] = trail
+            # ----------------------------------
+
             fwd["headers"] = headers
             self.node.send_direct(nh, fwd)
 
@@ -123,11 +153,8 @@ class LSRRouter:
             self.handle_lsp(msg, incoming_neighbor)
 
         elif mtype == TYPE_HELLO:
-            rep = dict(msg)
-            rep["type"] = 'echo'
-            rep["to"] = msg["from"]
-            rep["from"] = self.node.id
-            self.node.send_direct(rep["to"], rep)
+            # No responder con ECHO en el cable (algunos peers lo rechazan)
+            return
 
         elif mtype == TYPE_ECHO:
             self.node.on_echo(msg)
